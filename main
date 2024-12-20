@@ -1,0 +1,698 @@
+/* Jon Pascone | https://www.audioalchemyinc.com | https://github.com/sfxredditor/CVStepSequencer |
+
+CV Step Outputs read pitch & decay; CV3 reads pitch in ZERO_MODE only
+CV1 = DronePitch; CV2 = PostDecayTrigger; CV3 = Keyboard; CV4 = GateOutput
+
+Design based on LookMumNoComputer's 8 step arduino sequencer:
+https://www.lookmumnocomputer.com/sequencer-keyboard
+*/
+
+// TODO
+// 1. Add decayLength 'teeter' in STOPPED to indicate decayLength of current step via CV3 (2?) in seq modes
+// 2. 
+
+#include <Adafruit_MCP4728.h>
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+
+// ADC 0-3 setup
+#define TEMPO_ANALOG_CHANNEL 3
+#define START_ANALOG_CHANNEL 1 
+#define STOP_ANALOG_CHANNEL 0
+
+// Teensy External Clock
+#define EXTERNAL_CLOCK_PIN 9   
+#define CLOCK_SWITCH_INT_PIN 8  
+#define CLOCK_SWITCH_EXT_PIN 10 
+
+// Teensy Direction
+#define FORWARDS 11
+#define BACK 12
+#define RESET 29
+#define ZERO 28
+
+Adafruit_MCP4728 mcp1, mcp2, mcp3;
+Adafruit_ADS1015 ads1015;
+
+// FW, BW, RESET, ZERO logic
+int val1 = HIGH, old_val1 = HIGH;
+int val2 = HIGH, old_val2 = HIGH;
+int val3 = HIGH, old_val3 = HIGH;
+int val4 = HIGH, old_val4 = HIGH;
+
+//init
+int pitchVolt[8] = {0};
+int decayVolt[8] = {0};
+
+int ledPins[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+int buttonPins[8] = {37, 36, 35, 34, 33, 32, 31, 30};
+int decayPots[8] = {A10, A11, A12, A13, A14, A15, A16, A17};
+int pitchPots[8] = {A0, A1, A2, A3, A6, A7, A8, A9};
+
+int currentStep = 0;
+uint32_t tempo = 1000;
+const int totalSteps = 8;
+unsigned long lastStepTime = 0; // needed for decayValue tracking
+unsigned long lastDecayTime[totalSteps]; //tracks last decay time for each step
+
+//// global variables for logging control
+// unsigned long lastLogTime = 0;  // Tracks the last log time
+// const unsigned long logInterval = 500;  // Log interval in milliseconds (e.g., every 500ms)
+
+// direction flags
+bool cvForwards = false;
+bool cvBackwards = false;
+bool zeroState = false;
+
+// clock mode state
+enum ClockMode {
+    INTERNAL_CLOCK,
+    EXTERNAL_CLOCK
+};
+ClockMode currentClockMode = INTERNAL_CLOCK; // default for loop to function with switch logic
+
+// seq state machine
+enum SequencerState {
+    STOPPED,
+    RUNNING,
+    ZERO_MODE
+};
+SequencerState currentState = STOPPED;
+
+// ext clock debounce parameters to handle noisy, repetitive signals from ext clock
+const unsigned long debounceDelay = 50;  // ms for debounce delay
+unsigned long lastClockTime = 0;         // last time the clock pulse was detected
+volatile bool clockTriggered = false;     // flag for clock signal trigger
+// needs to be volitale to optimize and avoid asyncronous issues
+// this delay mitigates subsequent signals outside range of 50 ms to filter out unwanted triggers
+
+void onClockEdge() {
+    if (!zeroState) { 
+        unsigned long currentTime = millis();
+        // detect current time in ms to check elapsed time since last clock edge
+        // if elapsed time > debounceDelay; clock pulse is valid
+        if (currentTime - lastClockTime > debounceDelay) {
+            clockTriggered = true;  // set flag for clock pulse
+            lastClockTime = currentTime;  // update lastClockTime to repect next debounce
+        }
+    }
+}
+
+void setup() {
+    Serial.begin(115200); 
+
+    unsigned long startTime = millis(); 
+    // time since teensy has been running, used to caclculate how long program has been waiting for serial mon
+    while (!Serial && (millis() - startTime < 3000)) {} 
+    // if no serial monitor, ensures loop runs for max of 3 seconds to prevent program from getting stuck
+    // if 3 seconds pass or serial monitor connects, the loop exits
+
+    Serial.println("Starting setup...");
+
+    // init DACs
+    if (!mcp1.begin(0x64)) Serial.println("No DAC 01 @ 0x64");
+    if (!mcp2.begin(0x63)) Serial.println("No DAC 02 @ 0x63");
+    if (!mcp3.begin(0x61)) Serial.println("No DAC 03 @ 0x61");
+
+    // init LEDs and buttons
+    for (int i = 0; i < totalSteps; i++) {
+        pinMode(ledPins[i], OUTPUT);
+        pinMode(buttonPins[i], INPUT_PULLUP);
+        lastDecayTime[i] = 0; // Initialize decay timers
+    }
+
+    // attach interrupt for external clock
+    attachInterrupt(digitalPinToInterrupt(EXTERNAL_CLOCK_PIN), onClockEdge, FALLING);
+    /* allows teensy to pause current execution and respond immediately to a clock signal edge event
+       assigns external clock pin (9) as the interrupt number recognized by teensy
+       falling specifies the interrupt triggers when the external clock transitions from high to low */
+    
+    // init direction and control switches
+    pinMode(FORWARDS, INPUT_PULLUP);
+    pinMode(BACK, INPUT_PULLUP);
+    pinMode(RESET, INPUT_PULLUP);
+    pinMode(ZERO, INPUT_PULLUP);
+
+    // init ADC
+    if (!ads1015.begin()) {
+        Serial.println("ADC initialization failed!");
+    } else {
+        Serial.println("ADC initialized.");
+    }
+
+    initializeSequencerOnPowerUp(); // initial sequencer setup
+    initializeZeroState();          // setup initial zero mode parameters
+    updateHorizontalCV();           // update CV for initial state
+    mcp3.setChannelValue(MCP4728_CHANNEL_C, 0);  // force CV3 is set to low at startup
+
+
+    Serial.println("Setup complete.");
+}
+
+void initializeSequencerOnPowerUp() {
+    bool forwardsPressed = digitalRead(FORWARDS) == LOW; // force low for regular power up behaviour 
+    bool backwardsPressed = digitalRead(BACK) == LOW;
+    // flags for fw/bw read on power up
+
+    if (forwardsPressed) { // force to step 0
+        currentStep = 0;
+        cvForwards = true;
+        cvBackwards = false;
+    } else if (backwardsPressed) {
+        currentStep = totalSteps - 1; // force start step 7
+        cvForwards = false;
+        cvBackwards = true;
+    } else {
+        currentStep = 0; // safety
+        cvForwards = true;
+        cvBackwards = false;
+    }
+
+    setDACOutput(currentStep, pitchVolt[currentStep]); // read pitchVolt of current step
+    digitalWrite(ledPins[currentStep], HIGH); // indicate sequence position
+
+    for (int i = 0; i < totalSteps; i++) {
+        if (i != currentStep) { // reset all non-active steps
+            setDACOutput(i, 0);
+            digitalWrite(ledPins[i], LOW); // force off other step LEDs
+        }
+    }
+     // ensure only the active step is on & outputting a voltage
+    Serial.print("Zoop Zoop Zoop! Current Step: ");
+    Serial.println(currentStep);
+}
+
+void initializeZeroState() {
+  for (int i = 0; i < totalSteps; i++) {
+    pitchVolt[i] = map(analogRead(pitchPots[i]), 0, 1023, 0, 4095); // read pitch
+    decayVolt[i] = map(analogRead(decayPots[i]), 0, 1023, 0, 4095); // read decay pots
+  }
+}
+
+void setDACOutput(int step, int value) {
+    if (step < 0 || step >= totalSteps) return; // saftey check for invalid step index
+    if (value < 0) value = 0; // min clamp
+    if (value > 4095) value = 4095; // max clamp
+
+    if (step < 4) {
+        mcp1.setChannelValue(static_cast<MCP4728_channel_t>(step), value); // need to cast for enum type, step 0 - 3 @ DAC 01
+    } else {
+        mcp2.setChannelValue(static_cast<MCP4728_channel_t>(step - 4), value); // step 4- 7 @ DAC 2
+    }
+}
+
+void updatePitchForCurrentStep() {
+    if (zeroState || currentState == ZERO_MODE) {
+        return; // prevents updates in ZERO_MODE
+    }
+    // read/map pitch per step
+    pitchVolt[currentStep] = map(analogRead(pitchPots[currentStep]), 0, 1023, 0, 4095); 
+    setDACOutput(currentStep, pitchVolt[currentStep]); // update DAC output for current step
+}
+
+// handles decay for CV2 (PostDecayTrigger)
+void processDecay(int step) {
+    if (zeroState) {
+        mcp3.setChannelValue(MCP4728_CHANNEL_B, 0); // CV2 forced LOW in ZERO_MODE
+        return;
+    }
+
+    if (currentState == STOPPED) {
+        mcp3.setChannelValue(MCP4728_CHANNEL_B, 0);  // CV2 forced OFF in STOPPED state
+        return; 
+    }
+
+    // decay time for external clock mode is independent of INT tempo
+    unsigned long elapsedTime = millis() - lastDecayTime[step];  // elapsed time since decay began
+
+    // INT & EXT clock modes both use decay pot to control decayLength
+    int decayValue = analogRead(decayPots[step]);
+    unsigned long decayLength = constrain(map(decayValue, 0, 1023, 50, 5000), 15, 5000);  // decayLength used to constrain decayValue
+
+    // if decay time is still running, keep the step output and CV2 low
+    if (elapsedTime < decayLength) {
+        setDACOutput(step, pitchVolt[step]);  // keep current step active
+        mcp3.setChannelValue(MCP4728_CHANNEL_B, 0);  // but force CV2 to remain LOW
+    } else {
+        // if decay time is complete, trigger CV2 and turn off current step output
+        mcp3.setChannelValue(MCP4728_CHANNEL_B, 4095);  // CV2: decay completion = HIGH
+        setDACOutput(step, 0);  // current step output = LOW
+
+        // **Explicitly turn off the LED for the step post-decay**
+        digitalWrite(ledPins[step], LOW); 
+    }
+}
+
+
+/* decayValue from all decayPots is processed into decayLength which is then clamped to a valid range,
+  decayLength is used across both modes to control duration of decay processing */
+
+int readTempo() {
+    long sum = 0;
+    for (int i = 0; i < 10; i++) {  // take 10 readings and average them
+        sum += ads1015.readADC_SingleEnded(TEMPO_ANALOG_CHANNEL);
+        delay(10);  // delay 10ms between readings for stabalization
+    }
+    return constrain(map(sum / 10, 0, 1023, 1200, 15), 15, 1200);  // average, map to tempo, & constrain
+}
+
+void controlCV2() {
+    // if in STOPPED state, explicitly turn off CV2
+    if (currentState == STOPPED) {
+        mcp3.setChannelValue(MCP4728_CHANNEL_B, 0);  // CV2 LOW
+    }
+}
+
+void loop() {
+    checkClockMode();  // check and set clock mode
+
+    if (!zeroState) {  
+        if (currentClockMode == EXTERNAL_CLOCK) {
+            updateSequencerWithClock(); // handle external clock updates
+            if (clockTriggered && currentState == RUNNING) {
+                clockTriggered = false; // reset clock trigger
+                advanceStep(); // move to next step
+            }
+        } else if (currentClockMode == INTERNAL_CLOCK && currentState == RUNNING) {
+            if (millis() - lastStepTime >= tempo) { // otherwise wait for time to advance
+                lastStepTime = millis(); // update step timer
+                advanceStep(); // move to next step
+            }
+        }
+    } else {
+        clockTriggered = false; // reset clock trigger for ZERO_MODE
+    }
+
+    if (currentState == STOPPED) {
+        updatePitchForCurrentStep(); // handle stopped state pitch updates
+        mcp3.setChannelValue(MCP4728_CHANNEL_B, 0);  // ensure CV2 is off during STOPPED state
+    }
+
+    // read inputs and process switches for sequencing controls
+    readCVInputs();
+    processSwitches();
+    updateDACAndLeds(); // update DAC outputs & LEDs
+    processDecay(currentStep); // handle decay for the current step
+}
+
+void checkClockMode() {
+  bool intPinState = digitalRead(CLOCK_SWITCH_INT_PIN); 
+  bool extPinState = digitalRead(CLOCK_SWITCH_EXT_PIN);
+
+  if (intPinState == LOW) {
+    currentClockMode = INTERNAL_CLOCK;  // set internal
+  } else if (extPinState == LOW) {
+    currentClockMode = EXTERNAL_CLOCK;  // set external
+  }
+}
+
+void readCVInputs() {
+    int tempoVal = ads1015.readADC_SingleEnded(TEMPO_ANALOG_CHANNEL); // read tempo cv input
+    // map tempo range and constrain to valid limits 
+    tempo = constrain(map(tempoVal, 0, 1023, 1200, 15), 15, 1200);
+
+    int startValue = ads1015.readADC_SingleEnded(START_ANALOG_CHANNEL);
+    int stopValue = ads1015.readADC_SingleEnded(STOP_ANALOG_CHANNEL);
+
+    if (startValue > 1000) {
+        currentState = RUNNING; // set seq to RUNNING
+    }
+    if (stopValue > 1000) {
+        currentState = STOPPED; // set seq to STOPPED
+    }
+
+    // update pitch immediately after inputs are read
+    if (currentState == STOPPED) {
+        updatePitchForCurrentStep();
+    }
+}
+
+// this tempo update function is unique to readTempo as it is solely for INT mode
+void tempoUpdate() {
+    // solely update tempo if we are in internal clock mode
+    if (currentClockMode == INTERNAL_CLOCK) {
+        int adcValue = ads1015.readADC_SingleEnded(TEMPO_ANALOG_CHANNEL);
+        tempo = map(adcValue, 0, 1023, 1200, 2); // map input to tempo range: 2s to 1200ms per quarter note
+    }
+}
+
+void updateSequencer() {
+    // read pitchPot on current step to ensure real-time updates
+    pitchVolt[currentStep] = map(analogRead(pitchPots[currentStep]), 0, 1023, 0, 4095);
+    
+    if (currentState == RUNNING) {
+        // get elapsed time for decay per currentStep
+        unsigned long elapsedTime = millis() - lastDecayTime[currentStep];
+
+        // read the decay pot value and calculate decay length
+        int decayValue = analogRead(decayPots[currentStep]);
+        unsigned long decayLength = constrain(map(decayValue, 0, 1023, tempo / 16, tempo), 15, 5000);
+        // decayLength is constrained 
+
+        if (elapsedTime >= decayLength) { // check if decay is complete 
+            // wait to trigger CV2 (PostDecayTrigger) until decay is complete
+            mcp3.setChannelValue(MCP4728_CHANNEL_B, 4095); 
+
+            // set DAC output and update CV1 per current step
+            setDACOutput(currentStep, pitchVolt[currentStep]);
+            mcp3.setChannelValue(MCP4728_CHANNEL_A, pitchVolt[currentStep]);  // mirror current step pitchVolt on CV1
+            mcp3.setChannelValue(MCP4728_CHANNEL_B, 0);  // CV2 LOW after decay
+
+            // ensure that sequencer advances to next step at consistant intervals determined by tempo
+            if (millis() - lastStepTime >= tempo) {
+                lastStepTime = millis();
+                advanceStep();
+
+                // loop throught to update
+                for (int i = 0; i < totalSteps; i++) {
+                    digitalWrite(ledPins[i], (i == currentStep) ? HIGH : LOW);  
+                }
+            }
+        } else {
+            // if decay is still active, continue outputting the pitch value
+            setDACOutput(currentStep, pitchVolt[currentStep]);  // maintain pitch output for the current step
+            mcp3.setChannelValue(MCP4728_CHANNEL_A, pitchVolt[currentStep]);  // CV1 pitch output
+            mcp3.setChannelValue(MCP4728_CHANNEL_B, 0);  // CV2 remains LOW until decay is complete
+        }
+    }
+}
+
+void updateSequencerWithClock() {
+    // read pitchPot for the current step to ensure real-time updates
+    pitchVolt[currentStep] = map(analogRead(pitchPots[currentStep]), 0, 1023, 0, 4095);
+    
+    // debounce logic to filter out noise
+    static bool lastClockState = HIGH; // store the previous clock state to track changes
+    // compare pin value to LOW to detect active state of ext clock
+    bool currentClockState = digitalRead(EXTERNAL_CLOCK_PIN) == LOW; 
+    static uint32_t lastDebounceTime = 0; // static var to track timestamp of last detected clock state change
+    const uint32_t debounceDelay = 10; // ensures clock signal is stable for at leasts 10ms before being considered valid
+
+    // check for clock state changes
+    if (currentClockState != lastClockState) {
+        lastDebounceTime = millis(); // update debounce timestamp when state changes
+    }
+
+    // clock signal only valid if debounce delay has passed
+    if (millis() - lastDebounceTime > debounceDelay) {
+        // detect falling edge (HIGH->LOW)
+        if (currentClockState == LOW && lastClockState == HIGH) { 
+            clockTriggered = true; // set clock trigger flag
+            lastClockState = currentClockState; // reset lastClockSstate for next check
+        }
+    }
+    
+    // process clock trigger when seq is running
+    if (clockTriggered && currentState == RUNNING) {
+        clockTriggered = false;  // reset clock flag after processing 
+        advanceStep();          // advance step on external clock pulse
+    }
+}
+
+// gate output
+void triggerGateOutput() {
+    mcp3.setChannelValue(MCP4728_CHANNEL_D, 4095);
+    delayMicroseconds(100); // ensures gate output stays HIGH long enough to register as pulse
+    delay(15); // control duration of gate output
+    mcp3.setChannelValue(MCP4728_CHANNEL_D, 0); // then off
+}
+
+void advanceStep() {
+    if (zeroState) return; // protects zero state functionality
+
+    // ensure the current step's output and LED are turned off before advancing
+    setDACOutput(currentStep, 0); // nullify DAC output for current step
+    digitalWrite(ledPins[currentStep], LOW); // turn off the current step's LED
+
+    triggerGateOutput(); // assign gate output for the step advance
+
+    // determine the next step based on the direction
+    if (cvBackwards) {
+        currentStep = (currentStep == 0) ? totalSteps - 1 : currentStep - 1; // wrap around to the last step in BW
+    } else {
+        currentStep = (currentStep + 1) % totalSteps; // wrap around to the first step in FW mode
+    }
+
+    /* BW: if currentStep == 0, wrap to the last step, otherwise decrement by 1
+       FW: if currentStep == totalSteps - 1, wrap to the first step, otherwise increment by 1. */
+
+    // update pitch for the new step
+    int currentPitch = analogRead(pitchPots[currentStep]); // read the pitchPot for the new step
+    pitchVolt[currentStep] = map(currentPitch, 0, 1023, 0, 4095);
+    setDACOutput(currentStep, pitchVolt[currentStep]); // output pitch for the new step
+
+    // reset decay timing for the new step
+    lastDecayTime[currentStep] = millis(); // track the start time for the decay
+    mcp3.setChannelValue(MCP4728_CHANNEL_B, 0); // ensure CV2 starts low for the new step
+
+    // update LEDs and DACs for the new step
+    for (int i = 0; i < totalSteps; i++) {
+        // only turn on the LED for the current step
+        digitalWrite(ledPins[i], (i == currentStep) ? HIGH : LOW);
+    }
+}
+
+
+// for CV1[PitchDrone], CV2[PostDecayTrigger], CV3[Keyboard], and CV4[GateOutput]
+void updateHorizontalCV() {
+    if (currentState == ZERO_MODE) { // check & protect ZERO_MODE
+        mcp3.setChannelValue(MCP4728_CHANNEL_A, 0); // clear CV1
+        mcp3.setChannelValue(MCP4728_CHANNEL_B, 0); // clear CV2
+        mcp3.setChannelValue(MCP4728_CHANNEL_C, 0); // clear CV3 (Keyboard)
+        mcp3.setChannelValue(MCP4728_CHANNEL_D, 0); // clear Gate output
+
+        // handle manual pitch control when buttonPressed in ZERO_MODE
+        int buttonCV = 0; // init at 0
+        for (int i = 0; i < totalSteps; i++) { // loop through all buttonPins
+            if (digitalRead(buttonPins[i]) == LOW) { // check if buttonPressed
+                buttonCV = pitchVolt[i]; // set pitchVolt to value of corresponding step
+                break; 
+            }
+        }
+        mcp3.setChannelValue(MCP4728_CHANNEL_C, buttonCV); // only send pitch if button pressed
+        return; // skip further actions in ZERO_MODE
+    }
+
+    // in all other states (STOPPED, RUNNING), CV1 should mirror the current step output
+    if (currentState == STOPPED || currentState == RUNNING) {
+        mcp3.setChannelValue(MCP4728_CHANNEL_A, pitchVolt[currentStep]);
+
+        // ensure CV2 is OFF (LOW) in STOPPED state and for normal RUNNING behavior
+        mcp3.setChannelValue(MCP4728_CHANNEL_B, 0); // CV2 remains low
+    }
+}
+
+// update DACs outputs & LEDs based on current seq state & position
+void updateDACAndLeds() {
+    static unsigned long lastSwitchTime = 0;  // Timer for CV3 switching in ZERO_MODE
+    static int currentCV3Index = 0;           // Current index for CV3 toggling
+    static bool buttonPressedState[totalSteps] = {false};  // Track button press states
+
+    // handle ZERO_MODE
+    if (zeroState) {
+        int activeButtons[totalSteps] = {0};  // list active buttons
+        int activeButtonCount = 0;           // track the number of active buttons
+
+        for (int i = 0; i < totalSteps; i++) { 
+            if (digitalRead(buttonPins[i]) == LOW) { // check if a button is pressed
+                if (!buttonPressedState[i]) { // trigger gate only once per press
+                    triggerGateOutput();
+                    buttonPressedState[i] = true;
+                }
+
+                // add pressed buttons to activeButton list
+                activeButtons[activeButtonCount++] = i;
+
+                // update pitch only for active button
+                pitchVolt[i] = map(analogRead(pitchPots[i]), 0, 1023, 0, 4095);
+                setDACOutput(i, pitchVolt[i]); // output pitch for the active button
+            } else {
+                // reset buttonState and DAC output if button is released
+                buttonPressedState[i] = false;
+                setDACOutput(i, 0);           // DAC output OFF for inactive buttons
+            }
+        }
+
+        // toggle between them via CV3, toggle between them based on tempo rate / toggle delay
+        if (activeButtonCount > 1) { 
+            unsigned long elapsedTime = millis() - lastSwitchTime; // time passed since last toggle
+            if (elapsedTime >= tempo) { // if toggle delay has passed
+                lastSwitchTime = millis(); // update last toggle timestamp
+                currentCV3Index = (currentCV3Index + 1) % activeButtonCount; // cycle through activeButtons
+                int currentButton = activeButtons[currentCV3Index]; //gets next activeButtons in sequence
+                mcp3.setChannelValue(MCP4728_CHANNEL_C, pitchVolt[currentButton]); // output pitch of activeButtons CV3
+                triggerGateOutput(); // gate for each switch
+            }
+        } else if (activeButtonCount == 1) {
+            // if only one button is pressed, CV3 outputs its pitch continuously
+            mcp3.setChannelValue(MCP4728_CHANNEL_C, pitchVolt[activeButtons[0]]);
+        } else {
+            // no buttons pressed: reset CV3
+            mcp3.setChannelValue(MCP4728_CHANNEL_C, 0);
+        }
+        return;
+    }
+
+    // handles STOPPED state
+    if (currentState == STOPPED) {
+        // CV1 mirrors the pitch value of the current step
+        mcp3.setChannelValue(MCP4728_CHANNEL_A, pitchVolt[currentStep]); // Update CV1
+
+        // CV2 stays off in STOPPED state
+        mcp3.setChannelValue(MCP4728_CHANNEL_B, 0); // CV2 OFF
+
+        // update LEDs,  only highlight current step
+        for (int i = 0; i < totalSteps; i++) {
+            digitalWrite(ledPins[i], (i == currentStep) ? HIGH : LOW); // highlight current step HIGH, else LOW
+        }
+        return; 
+    }
+
+    // handles RUNNING state
+    if (currentState == RUNNING) {
+        // ensure CV1 outputs the pitch value of the current step
+        mcp3.setChannelValue(MCP4728_CHANNEL_A, pitchVolt[currentStep]);
+
+        // Process decay for the current step
+        processDecay(currentStep);
+
+        // update LEDs based on the decay state
+        for (int i = 0; i < totalSteps; i++) {
+            // turn on LED only for the current step if its decay is active
+            if (i == currentStep) {
+                unsigned long elapsedTime = millis() - lastDecayTime[i];
+                int decayValue = analogRead(decayPots[i]);
+                unsigned long decayLength = constrain(map(decayValue, 0, 1023, 50, 5000), 15, 5000);
+
+                // LED is ON only if decay is still active
+                digitalWrite(ledPins[i], (elapsedTime < decayLength) ? HIGH : LOW);
+            } else {
+                digitalWrite(ledPins[i], LOW); // all other LEDs OFF
+            }
+        }
+    }
+}
+
+// switch logic processing
+void processSwitches() {
+    val1 = digitalRead(FORWARDS);
+    val2 = digitalRead(BACK);
+    val4 = digitalRead(RESET);
+    val3 = digitalRead(ZERO);
+
+    if (val3 == LOW && old_val3 == HIGH) { // detect zero_mode activation
+        // turn off all step leds and dac outputs explicitly before entering zero_mode
+        for (int i = 0; i < totalSteps; i++) {
+            digitalWrite(ledPins[i], LOW);  // turn off all leds
+            setDACOutput(i, 0);             // clear all dac outputs
+        }
+
+        // activate zero_mode
+        zeroState = true;
+        currentState = ZERO_MODE; // set to zero_mode
+
+        resetOutputsForZeroMode();  // reset outputs for zero_mode
+        Serial.println("entered zero_mode.");
+    }
+
+    if (zeroState && val3 == HIGH) { // detect deactivation of zero_mode
+        zeroState = false; // deactivate zero_mode
+        currentState = STOPPED; // transition to stopped state
+        Serial.println("exiting zero_mode.");
+    }
+
+    if (zeroState) { // handle switches in zero_mode
+        // check if reset is triggered
+        if (val4 == LOW && old_val4 == HIGH) { 
+            // turn off all leds and dac outputs before resetting
+            for (int i = 0; i < totalSteps; i++) { 
+                digitalWrite(ledPins[i], LOW);
+                setDACOutput(i, 0); // clear dac output for each step
+            }
+
+            // force reset to step 0 (forward mode) or step 7 (backward mode)
+            currentStep = (cvForwards) ? 0 : totalSteps - 1;
+            digitalWrite(ledPins[currentStep], HIGH); // highlight reset step led
+            setDACOutput(currentStep, pitchVolt[currentStep]); // output pitch for the reset step
+
+            // maintain zero_mode state
+            zeroState = true;
+            currentState = ZERO_MODE;
+
+            Serial.print("reset in zero_mode: current step = ");
+            Serial.println(currentStep);
+        }
+        old_val4 = val4; // save current reset switch state
+        return; // exit after handling reset in zero_mode
+    }
+
+    // handle other switches when not in zero_mode
+    if (!zeroState) {
+        // forwards switch state handling
+        if (val1 == LOW && old_val1 == HIGH) {
+            // turn off current step before switching direction
+            digitalWrite(ledPins[currentStep], LOW);
+            setDACOutput(currentStep, 0); // clear current step dac output
+
+            cvForwards = true;  // enable forward mode
+            cvBackwards = false; // disable backward mode
+
+            if (currentState != STOPPED) currentState = RUNNING; // transition to running if not stopped
+            Serial.println("forwards selected.");
+        }
+        old_val1 = val1; // save current forwards state
+
+        // backwards switch state handling
+        if (val2 == LOW && old_val2 == HIGH) {
+            // turn off current step before switching direction
+            digitalWrite(ledPins[currentStep], LOW);
+            setDACOutput(currentStep, 0); // clear current step dac output
+
+            cvBackwards = true;  // enable backward mode
+            cvForwards = false;  // disable forward mode
+
+            if (currentState != STOPPED) currentState = RUNNING; // transition to running if not stopped
+            Serial.println("backwards selected.");
+        }
+        old_val2 = val2; // save current backwards state
+
+        // reset switch handling
+        if (val4 == LOW && old_val4 == HIGH) {
+            // turn off all leds and dac outputs before resetting
+            for (int i = 0; i < totalSteps; i++) { 
+                digitalWrite(ledPins[i], LOW);
+                setDACOutput(i, 0); // clear dac output for each step
+            }
+
+            // force reset to step 0 (forward mode) or step 7 (backward mode)
+            currentStep = (cvForwards) ? 0 : totalSteps - 1;
+            digitalWrite(ledPins[currentStep], HIGH); // highlight reset step led
+            setDACOutput(currentStep, pitchVolt[currentStep]); // output pitch for reset step
+
+            if (currentState != STOPPED) currentState = RUNNING; // transition to running if not stopped
+            Serial.println("reset triggered.");
+        }
+        old_val4 = val4; // save current reset switch state
+    }
+
+    old_val3 = val3; // save current zero_mode switch state
+}
+
+// extra safety for proper function of ZERO_MODE for clean reset
+void resetOutputsForZeroMode() {
+    // explicitly turn off the current step's LED and DAC output
+    digitalWrite(ledPins[currentStep], LOW);
+    setDACOutput(currentStep, 0);
+
+    // turn off all step LEDs and clear all DAC outputs, loop through to ensure that
+    for (int i = 0; i < totalSteps; i++) {
+        digitalWrite(ledPins[i], LOW); // all step LEDs OFF
+        setDACOutput(i, 0); // clear all step DAC outputs
+    }
+
+    // reset all CV outputs
+    mcp3.setChannelValue(MCP4728_CHANNEL_A, 0); // CV1
+    mcp3.setChannelValue(MCP4728_CHANNEL_B, 0); // CV2
+    mcp3.setChannelValue(MCP4728_CHANNEL_C, 0); // CV3
+    mcp3.setChannelValue(MCP4728_CHANNEL_D, 0); // gate output
+}
